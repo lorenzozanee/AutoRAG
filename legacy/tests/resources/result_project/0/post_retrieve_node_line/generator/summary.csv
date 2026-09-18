@@ -1,0 +1,2 @@
+filename,module_name,module_params,execution_time,average_output_token,bleu,meteor,rouge,is_best
+0.parquet,LlamaIndexLLM,{'llm': 'mock'},0.04772498607635498,6011.0,0.1672467560201074,0.06799841558577839,0.01740092611270564,True

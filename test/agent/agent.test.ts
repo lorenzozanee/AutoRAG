@@ -1,0 +1,499 @@
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { Type } from "typebox";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { AutoRAGAgent } from "../../src/agent/agent.ts";
+import { buildSystemPrompt } from "../../src/agent/system-prompt.ts";
+import { RetrievalMemory } from "../../src/memory/memory.ts";
+
+const FIXTURE_DIR = "test/fixtures/sample-project";
+let tmpDir: string;
+
+beforeEach(() => {
+	tmpDir = mkdtempSync(join(tmpdir(), "autorag-agent-test-"));
+});
+
+afterEach(() => {
+	rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function makeTool(name: string): AgentTool {
+	return {
+		name,
+		label: name,
+		description: `${name} tool`,
+		parameters: Type.Object({ query: Type.String() }),
+		async execute() {
+			return { content: [{ type: "text", text: "ok" }], details: { resultCount: 1, method: name, sources: [] } };
+		},
+	};
+}
+
+interface AgentInternals {
+	lastQuery: string | undefined;
+	memory: RetrievalMemory;
+	minSyncMethod:
+		| {
+				describe(): { name: string };
+				isBinaryMissing(): boolean;
+		  }
+		| undefined;
+	innerAgent: {
+		transformContext?: (
+			messages: Array<{ role: "user"; content: Array<{ type: "text"; text: string }>; timestamp: number }>,
+		) => Promise<Array<{ role: string; content: Array<{ type: "text"; text: string }>; timestamp: number }>>;
+	};
+	tools: readonly AgentTool[];
+}
+
+function internals(agent: AutoRAGAgent): AgentInternals {
+	return agent as unknown as AgentInternals;
+}
+
+function fakeModel() {
+	return { id: "test-model", provider: "test-provider", api: "test-api" } as never;
+}
+
+describe("AutoRAGAgent", () => {
+	it("rejects a non-positive search timeout", () => {
+		expect(
+			() =>
+				new AutoRAGAgent({
+					searchPaths: [FIXTURE_DIR],
+					memoryPath: join(tmpDir, "memory.json"),
+					searchTimeoutMs: 0,
+				}),
+		).toThrow("searchTimeoutMs must be a positive finite number");
+	});
+
+	it("rejects a non-positive tool-call limit", () => {
+		expect(
+			() =>
+				new AutoRAGAgent({
+					searchPaths: [FIXTURE_DIR],
+					memoryPath: join(tmpDir, "memory.json"),
+					maxSearchToolCalls: 1.5,
+				}),
+		).toThrow("maxSearchToolCalls must be a positive integer");
+	});
+
+	it("aborts and rejects when a search exceeds its timeout", async () => {
+		let abortCalls = 0;
+		const session = {
+			agent: { subscribe: () => () => undefined, state: { messages: [] } },
+			prompt: async () => await new Promise<void>(() => undefined),
+			abort: async () => {
+				abortCalls += 1;
+			},
+			dispose: () => undefined,
+		};
+		const agent = new AutoRAGAgent({
+			model: fakeModel(),
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			searchTimeoutMs: 10,
+		});
+		(agent as unknown as { createSearchSession: () => typeof session }).createSearchSession = () => session;
+
+		const search = agent.searchDocuments("timeout query");
+		await expect(search).rejects.toThrow("search timed out after 10ms");
+		expect(abortCalls).toBe(1);
+	});
+
+	it("aborts a search after the configured retrieval tool-call limit", async () => {
+		let abortCalls = 0;
+		const session = {
+			agent: {
+				subscribe: (listener: (event: unknown) => void) => {
+					listener({
+						type: "tool_execution_end",
+						toolName: "semantic_search_local_docs",
+						result: { details: { method: "minsync" } },
+					});
+					return () => undefined;
+				},
+				state: { messages: [] },
+			},
+			prompt: async () => undefined,
+			abort: async () => {
+				abortCalls += 1;
+			},
+			dispose: () => undefined,
+		};
+		const agent = new AutoRAGAgent({
+			model: fakeModel(),
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			maxSearchToolCalls: 1,
+			jikji: false,
+			minSync: false,
+		});
+		(agent as unknown as { createSearchSession: () => typeof session }).createSearchSession = () => session;
+
+		const response = await agent.searchDocuments("cap query");
+		expect(response.results).toEqual([]);
+		expect(
+			response.diagnostics?.some(
+				(diagnostic) => diagnostic.code === "missing-final-emit" && diagnostic.severity === "warning",
+			),
+		).toBe(true);
+		expect(response.retrievalTrace).toEqual([]);
+		expect(abortCalls).toBe(1);
+	});
+
+	it("limits each retrieval tool to three executions", async () => {
+		const agent = new AutoRAGAgent({
+			model: fakeModel(),
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			minSync: false,
+			jikji: false,
+		});
+		const tool = internals(agent).tools.find((entry) => entry.name === "semantic_search_local_docs");
+		expect(tool).toBeDefined();
+		const execute = tool?.execute as (id: string, params: { query: string }) => Promise<{ details?: unknown }>;
+		for (let i = 0; i < 3; i++) await execute(`call-${i}`, { query: "same source" });
+		const fourth = await execute("call-4", { query: "same source" });
+		expect(fourth.details).toMatchObject({ limitReached: true });
+	});
+
+	it("creates with default config", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		expect(agent).toBeDefined();
+	});
+
+	it("accepts MinSync chunk size configuration", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			minSync: { maxChunkSize: 1000, autoInstall: false },
+		});
+
+		expect((internals(agent).minSyncMethod as unknown as { maxChunkSize?: number }).maxChunkSize).toBe(1000);
+	});
+
+	it("registers the dupey duplicate scan tool by default", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		expect(internals(agent).tools.map((tool) => tool.name)).toContain("scan_duplicate_documents");
+	});
+
+	it("can disable the dupey duplicate scan tool", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			dupey: false,
+		});
+		expect(internals(agent).tools.map((tool) => tool.name)).not.toContain("scan_duplicate_documents");
+	});
+
+	it("defaults to direct retrieval and reading tools for library mode", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("librarian");
+		expect(prompt).toContain("read the relevant source material directly");
+		expect(prompt).toContain("Use `bash` to open and verify relevant local files");
+		expect(prompt).toContain("check_memory");
+		for (const name of ["semantic_search_local_docs", "search_all_documents", "search_datasource_documents"]) {
+			expect(prompt).toContain(name);
+		}
+		// deleted builtin/posix surface is gone
+		expect(prompt).not.toContain("search_posix_documents");
+		expect(prompt).not.toContain("read_file");
+		expect(prompt).not.toContain("READ-ONLY");
+		expect(prompt).not.toContain("No raw paths");
+	});
+
+	it("includes caller-provided search tools in system prompt", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			tools: [makeTool("search_custom")],
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("search_custom");
+	});
+
+	it("includes manifest descriptions in system prompt when manifestDir provided", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			manifestDir: "test/fixtures/manifests",
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("codebase-vectors");
+	});
+
+	it("system prompt references provided tools", () => {
+		const prompt = buildSystemPrompt({
+			toolNames: ["grep", "find", "read", "ls", "check_memory"],
+			memoryEntries: [],
+			manifests: [],
+		});
+		expect(prompt).toContain("grep");
+		expect(prompt).toContain("find");
+		expect(prompt).toContain("read");
+		expect(prompt).not.toContain("read_file");
+	});
+
+	it("system prompt exposes bash and omits removed read_file", () => {
+		const prompt = buildSystemPrompt({
+			toolNames: ["check_memory"],
+			memoryEntries: [],
+			manifests: [],
+		});
+		expect(prompt).toContain("bash");
+		expect(prompt).not.toContain("read_file");
+		expect(prompt).toContain("find/grep");
+	});
+
+	it("submitFeedback resolves pending entries and saves to disk", () => {
+		const memPath = join(tmpDir, "memory.json");
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: memPath,
+		});
+		internals(agent).lastQuery = "find typescript files";
+		internals(agent).memory.append({ query: "find typescript files", method: "grep", outcome: "pending" });
+		agent.submitFeedback(undefined, true);
+		expect(existsSync(memPath)).toBe(true);
+		const memory = new RetrievalMemory({ storagePath: memPath });
+		memory.load();
+		expect(
+			memory.getMethodHints("find typescript files").find((hint) => hint.method === "grep")?.score,
+		).toBeGreaterThan(0);
+	});
+
+	it("subscribe returns an unsubscribe function", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const unsubscribe = agent.subscribe(() => undefined);
+		expect(typeof unsubscribe).toBe("function");
+		expect(() => unsubscribe()).not.toThrow();
+	});
+
+	it("system prompt includes search strategy guidance", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("Search Strategy");
+		expect(prompt).toContain("glob");
+		expect(prompt).toContain("regex");
+		expect(prompt).toContain("timeout");
+		expect(prompt).not.toContain("Fallback Chain");
+	});
+
+	it("system prompt routes output through emit_autorag_results without an internal_mapping channel", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("emit_autorag_results");
+		expect(prompt).toContain("[1]");
+		expect(prompt).toContain("curate");
+		expect(prompt).not.toContain("<internal_mapping>");
+		expect(prompt).not.toContain("internal_mapping");
+	});
+
+	it("system prompt includes behavioral constraints", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("Constraints");
+		expect(prompt).toContain("No fabrication");
+		expect(prompt).not.toContain("READ-ONLY");
+		expect(prompt).not.toContain("No raw paths");
+		expect(prompt).not.toContain("internal_mapping");
+	});
+
+	it("system prompt tool reference includes check_memory", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const prompt = agent.getSystemPrompt();
+		expect(prompt).toContain("check_memory");
+	});
+
+	it("submitFeedback resolves all pending entries for the query", () => {
+		const memPath = join(tmpDir, "memory.json");
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: memPath,
+		});
+		internals(agent).lastQuery = "test query";
+		internals(agent).memory.append({ query: "test query", method: "grep", outcome: "pending" });
+		internals(agent).memory.append({ query: "test query", method: "find", outcome: "pending" });
+		agent.submitFeedback(undefined, true);
+
+		const memory = new RetrievalMemory({ storagePath: memPath });
+		memory.load();
+		const hints = memory.getMethodHints("test query");
+		expect(hints.find((hint) => hint.method === "grep")?.score).toBeGreaterThan(0);
+		expect(hints.find((hint) => hint.method === "find")?.score).toBeGreaterThan(0);
+	});
+
+	it("submitFeedback does nothing when no lastQuery", () => {
+		const memPath = join(tmpDir, "memory.json");
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: memPath,
+		});
+		agent.submitFeedback(undefined, true);
+		expect(existsSync(memPath)).toBe(false);
+	});
+
+	it("recordResultFeedback() is a public method", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		expect(typeof agent.recordResultFeedback).toBe("function");
+	});
+
+	it("recordResultFeedback() resolves pending entries by source", () => {
+		const memPath = join(tmpDir, "memory.json");
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: memPath,
+		});
+		const entry = internals(agent).memory.append({ query: "q", method: "grep", outcome: "pending" });
+		internals(agent).memory.registerAttempt({
+			id: entry.id,
+			query: "q",
+			method: "grep",
+			sources: ["src/a.ts"],
+			timestamp: Date.now(),
+		});
+		agent.recordResultFeedback([{ source: "src/a.ts", useful: true }]);
+
+		const memory = new RetrievalMemory({ storagePath: memPath });
+		memory.load();
+		expect(memory.getMethodHints("q").find((hint) => hint.method === "grep")?.score).toBeGreaterThan(0);
+	});
+
+	it("injects memory context when durable insights exist without live hints", async () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		internals(agent).lastQuery = "photo archive lookup";
+		for (let i = 0; i < 600; i++) internals(agent).memory.recordFeedback("photo archive lookup", "posix", true);
+		internals(agent).memory.save();
+		internals(agent).memory.getSchema().feedbackSignals = [];
+
+		const transformed = await internals(agent).innerAgent.transformContext?.([
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() },
+		]);
+
+		expect(transformed?.[0].content[0].text).toContain("<memory_context>");
+		expect(transformed?.[0].content[0].text).toContain("Long-Term Retrieval Insights");
+		expect(transformed?.[0].content[0].text).toContain("photo archive lookup");
+	});
+
+	it("getResultRegistry returns empty map initially", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		expect(agent.getResultRegistry().size).toBe(0);
+	});
+});
+
+describe("AutoRAGAgent default method registration", () => {
+	it("registers MinSync and hybrid by default when options omit them", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const internal = internals(agent);
+		expect(internal.minSyncMethod).toBeDefined();
+		expect(internal.minSyncMethod?.describe().name).toBe("minsync");
+		expect(agent.getMethodRegistry().getByType("hybrid")).toHaveLength(1);
+	});
+
+	it("does not register MinSync when minSync: false is passed", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			minSync: false,
+		});
+		expect(internals(agent).minSyncMethod).toBeUndefined();
+		expect(agent.getMethodRegistry().getByType("hybrid")).toHaveLength(0);
+	});
+
+	it("defaults MinSync autoInstall to true when undefined", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		expect(internals(agent).minSyncMethod).toBeDefined();
+	});
+});
+
+describe("AutoRAGAgent.getRetrievalEngine delegation", () => {
+	it("passes isMinSyncBinaryMissing hook when minSync is configured", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const internal = internals(agent);
+		const engine = agent.getRetrievalEngine();
+		// The engine's internal isMinSyncBinaryMissing should be set when
+		// minSyncMethod is present.
+		const engineInternals = engine as unknown as { isMinSyncBinaryMissing: (() => boolean) | undefined };
+		expect(engineInternals.isMinSyncBinaryMissing).toBeDefined();
+		// The predicate should match the agent's binary-missing state.
+		const binaryMissing = internal.minSyncMethod?.isBinaryMissing?.() ?? true;
+		expect(engineInternals.isMinSyncBinaryMissing!()).toBe(binaryMissing);
+	});
+
+	it("omits isMinSyncBinaryMissing hook when minSync: false", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+			minSync: false,
+		});
+		const engine = agent.getRetrievalEngine();
+		const engineInternals = engine as unknown as { isMinSyncBinaryMissing: (() => boolean) | undefined };
+		expect(engineInternals.isMinSyncBinaryMissing).toBeUndefined();
+	});
+
+	it("getRetrievalEngine() registers all agent methods", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const engine = agent.getRetrievalEngine();
+		// Should include the registered methods (minsync, hybrid, etc.)
+		expect(engine.getMethodRegistry().get("minsync")).toBeDefined();
+		expect(engine.getMethodRegistry().list().length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("getRetrievalEngine() is cached (same instance on second call)", () => {
+		const agent = new AutoRAGAgent({
+			searchPaths: [FIXTURE_DIR],
+			memoryPath: join(tmpDir, "memory.json"),
+		});
+		const first = agent.getRetrievalEngine();
+		const second = agent.getRetrievalEngine();
+		expect(first).toBe(second);
+	});
+});

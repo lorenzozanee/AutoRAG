@@ -1,0 +1,1 @@
+Root product: TypeScript, Bun, Node >=24, Vitest, Biome, strict tsc. package scripts include lint, typecheck, test, build; lockfile is bun.lock.

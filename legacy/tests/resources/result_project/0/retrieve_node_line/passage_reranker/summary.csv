@@ -1,0 +1,2 @@
+filename,module_name,module_params,execution_time,passage_reranker_retrieval_f1,passage_reranker_retrieval_recall,passage_reranker_retrieval_precision,is_best
+0.parquet,Tart,{'top_k': 5},3.839238500595093,0.33333333333333337,1.0,0.2,True

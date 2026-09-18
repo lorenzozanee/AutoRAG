@@ -1,0 +1,285 @@
+/**
+ * Config-driven factory for the built-in connector-backed datasource skills.
+ *
+ * The CLI/server layer passes the trusted `datasources` section of
+ * `config.json`; this factory materializes one skill per configured entry.
+ * Model/tool arguments never reach this factory — it is part of the trusted
+ * configuration path. Unknown skill names and disabled entries are skipped
+ * and reported so setup surfaces actionable (but path-opaque) feedback.
+ */
+
+import { AliasedDatasourceSkill } from "../aliased-skill.ts";
+import { DescribedDatasourceSkill } from "../described-skill.ts";
+import type { DatasourceSkill } from "../types.ts";
+import { ClawGalleryClient, type ClawGalleryOptions, ClawGallerySkill } from "./clawgallery/index.ts";
+import { CloudDriveSkill, type RcloneConnectorOptions } from "./cloud-drive/index.ts";
+import {
+	DiscrawlClient,
+	type DiscrawlEmbeddingRuntime,
+	type DiscrawlOptions,
+	DiscrawlSkill,
+} from "./discrawl/index.ts";
+import { type GitHubConnectorOptions, GitHubSkill } from "./github/index.ts";
+import { KatokClient, type KatokOptions, KatokSkill } from "./katok/index.ts";
+import { type MailExportConnectorOptions, MailExportSkill } from "./mail-export/index.ts";
+import { type MailcrawlOptions, MailcrawlSkill } from "./mailcrawl/index.ts";
+import { type NotcrawlOptions, NotionSkill } from "./notion/index.ts";
+import { ObsidianSkill } from "./obsidian/index.ts";
+import { type RssConnectorOptions, RssSkill } from "./rss/index.ts";
+import { SlackSkill, type SlacrawlOptions } from "./slack/index.ts";
+import { type SpotlightConnectorOptions, SpotlightSkill } from "./spotlight/index.ts";
+import { type TelecrawlOptions, TelecrawlSkill } from "./telecrawl/index.ts";
+import { type WacrawlOptions, WacrawlSkill } from "./wacrawl/index.ts";
+
+/** One configured datasource entry (the trusted `datasources.<name>` value). */
+export interface DatasourceSkillConfig {
+	readonly enabled?: boolean;
+	/** Operator-authored context shown to the agent for this connection. */
+	readonly description?: string;
+	/** Built-in datasource template used when the config key is a connection alias. */
+	readonly type?: string;
+	readonly instanceId?: string;
+	readonly pollingIntervalMs?: number;
+	readonly tags?: readonly string[];
+	/** Connector-specific options (token env names, repos, feeds, paths, …). */
+	readonly connector?: Record<string, unknown>;
+	/** Optional chat/channel allowlist; absent means all channels. */
+	readonly channels?: {
+		readonly ids?: readonly string[];
+		readonly names?: readonly string[];
+	};
+}
+
+/** The trusted `datasources` config section: skill name → config. */
+export type DatasourcesConfig = Readonly<Record<string, DatasourceSkillConfig | boolean>>;
+
+export interface BuildDatasourceSkillsResult {
+	readonly skills: readonly DatasourceSkill[];
+	/** Names that were configured but not recognized. */
+	readonly unknown: readonly string[];
+}
+
+type SkillBuilder = (
+	config: DatasourceSkillConfig,
+	workspaceRoot: string | undefined,
+	registrationName: string,
+	embeddingRuntime?: DiscrawlEmbeddingRuntime,
+) => DatasourceSkill | undefined;
+
+const BUILDERS: Readonly<Record<string, SkillBuilder>> = {
+	telegram: (config, _workspaceRoot, registrationName) =>
+		new TelecrawlSkill({
+			datasourceId: registrationName,
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+			channelIds: config.channels?.ids,
+			channelNames: config.channels?.names,
+			connectorOptions: {
+				...(config.connector as TelecrawlOptions),
+				...(_workspaceRoot === undefined ? {} : { workspacePath: _workspaceRoot }),
+			},
+		}),
+	whatsapp: (config, _workspaceRoot, registrationName) =>
+		new WacrawlSkill({
+			datasourceId: registrationName,
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+			channelIds: config.channels?.ids,
+			channelNames: config.channels?.names,
+			connectorOptions: {
+				...(config.connector as WacrawlOptions),
+				...(_workspaceRoot === undefined ? {} : { workspacePath: _workspaceRoot }),
+			},
+		}),
+	slack: (config, _workspaceRoot, registrationName) =>
+		new SlackSkill({
+			datasourceId: registrationName,
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+			channelIds: config.channels?.ids,
+			channelNames: config.channels?.names,
+			connectorOptions: {
+				...(config.connector as SlacrawlOptions),
+				...(_workspaceRoot === undefined ? {} : { workspacePath: _workspaceRoot }),
+			},
+		}),
+	discord: (config, workspaceRoot, registrationName, embeddingRuntime) => {
+		const connector = (config.connector ?? {}) as DiscrawlOptions & { readonly embedLimit?: number };
+		const clientOptions: DiscrawlOptions = {
+			...connector,
+			...(connector.root === undefined && workspaceRoot !== undefined ? { root: workspaceRoot } : {}),
+		};
+		return new DiscrawlSkill({
+			datasourceId: registrationName,
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+			channelIds: config.channels?.ids,
+			channelNames: config.channels?.names,
+			client: new DiscrawlClient({
+				...clientOptions,
+				...(embeddingRuntime === undefined ? {} : { embeddingRuntime }),
+			}),
+			...(connector.embeddingModel !== undefined ? { embeddingModel: connector.embeddingModel } : {}),
+			...(connector.defaultMode !== undefined ? { defaultMode: connector.defaultMode } : {}),
+			...(connector.embedLimit !== undefined ? { embedLimit: connector.embedLimit } : {}),
+		});
+	},
+	clawgallery: (config, workspaceRoot, registrationName) => {
+		const connector = (config.connector ?? {}) as ClawGalleryOptions;
+		const clientOptions: ClawGalleryOptions = {
+			...connector,
+			...(connector.configDir === undefined && workspaceRoot !== undefined
+				? { configDir: `${workspaceRoot}/.autorag/datasources/clawgallery/${registrationName}` }
+				: {}),
+		};
+		return new ClawGallerySkill({
+			client: new ClawGalleryClient(clientOptions),
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+			...(connector.defaultMode !== undefined ? { defaultMode: connector.defaultMode } : {}),
+			...(connector.syncVisual !== undefined ? { syncVisual: connector.syncVisual } : {}),
+			...(connector.vdrBackend !== undefined ? { vdrBackend: connector.vdrBackend } : {}),
+		});
+	},
+	notion: (config, workspaceRoot, registrationName) =>
+		new NotionSkill({
+			datasourceId: registrationName,
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+			connectorOptions: {
+				...(config.connector as NotcrawlOptions),
+				...(workspaceRoot === undefined ? {} : { workspacePath: workspaceRoot }),
+			},
+		}),
+	kakao: (config, _workspaceRoot, _registrationName) =>
+		new KatokSkill({
+			client: new KatokClient({
+				...(config.connector as KatokOptions),
+			}),
+			...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+			...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+			...(config.tags !== undefined ? { tags: config.tags } : {}),
+		}),
+	github: (config, workspaceRoot, registrationName) =>
+		new GitHubSkill({
+			...common(config, workspaceRoot),
+			skillName: registrationName,
+			connectorOptions: config.connector as GitHubConnectorOptions,
+		}),
+	"cloud-drive": (config, workspaceRoot, registrationName) =>
+		new CloudDriveSkill({
+			...common(config, workspaceRoot),
+			skillName: registrationName,
+			provider: typeof config.connector?.provider === "string" ? config.connector.provider : undefined,
+			connectorOptions: {
+				...(config.connector as RcloneConnectorOptions),
+			},
+		}),
+	"mail-export": (config, workspaceRoot, registrationName) =>
+		new MailExportSkill({
+			...common(config, workspaceRoot),
+			skillName: registrationName,
+			connectorOptions: config.connector as MailExportConnectorOptions,
+		}),
+	mailcrawl: (config, workspaceRoot, registrationName) =>
+		new MailcrawlSkill({
+			...common(config, workspaceRoot),
+			datasourceId: registrationName,
+			...(config.connector as MailcrawlOptions),
+		}),
+	obsidian: (config, workspaceRoot, registrationName) => {
+		const connector = config.connector as
+			| { vaultPath?: string; binaryPath?: string; configPath?: string }
+			| undefined;
+		return new ObsidianSkill({
+			...common(config, workspaceRoot),
+			datasourceId: registrationName,
+			...(connector?.vaultPath !== undefined ? { vaultPath: connector.vaultPath } : {}),
+			...(connector?.binaryPath !== undefined ? { binaryPath: connector.binaryPath } : {}),
+			...(workspaceRoot !== undefined ? { workspaceRoot } : {}),
+			...(connector?.configPath !== undefined ? { configPath: connector.configPath } : {}),
+		});
+	},
+	rss: (config, workspaceRoot, registrationName) =>
+		new RssSkill({
+			...common(config, workspaceRoot),
+			skillName: registrationName,
+			connectorOptions: config.connector as RssConnectorOptions,
+		}),
+	spotlight: (config, workspaceRoot, registrationName) =>
+		new SpotlightSkill({
+			...common(config, workspaceRoot),
+			skillName: registrationName,
+			connectorOptions: config.connector as SpotlightConnectorOptions,
+		}),
+};
+
+/** Skill names this factory can build. */
+export const BUILTIN_DATASOURCE_SKILL_NAMES: readonly string[] = Object.keys(BUILDERS);
+
+function common(config: DatasourceSkillConfig, workspaceRoot: string | undefined) {
+	return {
+		...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+		...(config.pollingIntervalMs !== undefined ? { pollingIntervalMs: config.pollingIntervalMs } : {}),
+		...(config.tags !== undefined ? { tags: config.tags } : {}),
+		...(workspaceRoot !== undefined ? { workspaceRoot } : {}),
+	};
+}
+
+/**
+ * Build datasource skills from the trusted config section. `false` or
+ * `{ enabled: false }` entries are skipped silently; unrecognized names are
+ * collected in `unknown` (never thrown) so callers can surface setup
+ * feedback without failing agent construction.
+ */
+export function buildDatasourceSkills(
+	config: DatasourcesConfig | undefined,
+	workspaceRoot?: string,
+	embeddingRuntime?: DiscrawlEmbeddingRuntime,
+): BuildDatasourceSkillsResult {
+	const skills: DatasourceSkill[] = [];
+	const unknown: string[] = [];
+	for (const [name, raw] of Object.entries(config ?? {})) {
+		if (raw === false) continue;
+		if (raw !== true && (typeof raw !== "object" || raw === null || Array.isArray(raw))) {
+			unknown.push(name);
+			continue;
+		}
+		const entry: DatasourceSkillConfig = raw === true ? {} : raw;
+		if (entry.enabled === false) continue;
+		const templateName = entry.type ?? name;
+		const builder = Object.hasOwn(BUILDERS, templateName) ? BUILDERS[templateName] : undefined;
+		if (builder === undefined) {
+			unknown.push(name);
+			continue;
+		}
+		const normalizedEntry =
+			entry.instanceId === undefined && entry.type !== undefined ? { ...entry, instanceId: name } : entry;
+		const skill = builder(normalizedEntry, workspaceRoot, name, embeddingRuntime);
+		if (skill === undefined) {
+			unknown.push(name);
+			continue;
+		}
+		const hasChannelFilter = (entry.channels?.ids?.length ?? 0) > 0 || (entry.channels?.names?.length ?? 0) > 0;
+		let aliased: DatasourceSkill = skill;
+		if (name !== templateName || hasChannelFilter) {
+			aliased = new AliasedDatasourceSkill(skill, {
+				alias: name,
+				...(entry.channels?.ids !== undefined ? { channelIds: entry.channels.ids } : {}),
+				...(entry.channels?.names !== undefined ? { channelNames: entry.channels.names } : {}),
+			});
+		}
+		skills.push(
+			typeof entry.description === "string" && entry.description.trim().length > 0
+				? new DescribedDatasourceSkill(aliased, entry.description.trim())
+				: aliased,
+		);
+	}
+	return { skills, unknown };
+}

@@ -1,0 +1,1 @@
+TypeScript uses tabs, Biome formatting, max line width 120, strict typing. Tests use temporary fake executables and clean them in afterEach. Root contributions target main and use PR review.

@@ -1,0 +1,1 @@
+Focused test: node_modules/.bin/vitest run test/datasource/skills/mailcrawl.test.ts. Normal checks: bun run lint; bun run typecheck; bun run test; bun run build; make ci. Install: bun install --frozen-lockfile.

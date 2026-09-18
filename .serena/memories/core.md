@@ -1,0 +1,1 @@
+AutoRAG 2.x root is TypeScript/Bun under src/, tests under test/. legacy/ is separate Python product. Datasource process wrappers use spawned CLI processes and process-tree lifecycle helpers.

@@ -1,0 +1,1 @@
+For root source changes run focused Vitest, bun run lint, bun run typecheck, bun run test, bun run build, and git diff --check where dependencies permit. Process lifecycle changes need Linux plus platform-aware review.
