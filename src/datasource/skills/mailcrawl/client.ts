@@ -1,6 +1,6 @@
-import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { portableSpawnCommand } from "../../../process/portable-spawn.ts";
+import { TREE_KILL_GRACE_MS, terminateProcessTree } from "../../../process/terminate-tree.ts";
 import { ensurePrivateMailcrawlDataDir, validateMailcrawlInstanceId } from "./config.ts";
 import type {
 	MailcrawlFailure,
@@ -182,45 +182,99 @@ function spawnMailcrawl(
 		const child = spawn(portable.command, portable.args, {
 			env,
 			detached: process.platform !== "win32",
+			windowsHide: true,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
-		let stdout: BoundedOutput = { text: "", bytes: 0, exceeded: false },
-			stderr: BoundedOutput = { text: "", bytes: 0, exceeded: false },
-			settled = false,
-			reason: MailcrawlFailureReason | undefined;
-		const max = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
+		let stdout: BoundedOutput = { text: "", bytes: 0, exceeded: false };
+		let stderr: BoundedOutput = { text: "", bytes: 0, exceeded: false };
+		let settled = false;
+		let finalReason: MailcrawlFailureReason | undefined;
+		let pipeGuard: ReturnType<typeof setTimeout> | undefined;
+		let escalation: ReturnType<typeof setTimeout> | undefined;
+		const setReason = (reason: MailcrawlFailureReason): void => {
+			if (finalReason === undefined) finalReason = reason;
+		};
+		const clearEscalation = (): void => {
+			if (escalation !== undefined) clearTimeout(escalation);
+			escalation = undefined;
+		};
+		const terminateWithEscalation = (): void => {
+			terminateProcessTree(child);
+			if (escalation === undefined) {
+				escalation = setTimeout(() => {
+					escalation = undefined;
+					terminateProcessTree(child, "SIGKILL");
+				}, TREE_KILL_GRACE_MS);
+			}
+		};
+		const settleWith = (result: ProcessResult): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (pipeGuard !== undefined) clearTimeout(pipeGuard);
+			clearEscalation();
+			signal?.removeEventListener("abort", abort);
+			resolveResult(result);
+		};
+		const finish = (code: number | null): void => {
+			if (finalReason !== undefined) {
+				settleWith({ ok: false, reason: finalReason, stdout: stdout.text, stderr: stderr.text, code });
+				return;
+			}
+			settleWith({
+				ok: code === 0,
+				reason: code === 0 ? undefined : "nonzero-exit",
+				stdout: stdout.text,
+				stderr: stderr.text,
+				code,
+			});
+		};
 		const timer = setTimeout(() => {
-			reason = "timeout";
-			terminate(child);
+			setReason("timeout");
+			terminateWithEscalation();
 		}, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-		const abort = () => {
-			reason = "aborted";
-			terminate(child);
+		const abort = (): void => {
+			setReason("aborted");
+			terminateWithEscalation();
 		};
 		if (signal?.aborted) abort();
 		signal?.addEventListener("abort", abort, { once: true });
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
+		const max = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
 		child.stdout.on("data", (chunk: string) => {
 			stdout = appendOutput(stdout, chunk, max);
-			if (stdout.exceeded && reason === undefined) {
-				reason = "stdout-too-large";
-				terminate(child);
+			if (stdout.exceeded) {
+				setReason("stdout-too-large");
+				terminateWithEscalation();
 			}
 		});
 		child.stderr.on("data", (chunk: string) => {
 			stderr = appendOutput(stderr, chunk, max);
-			if (stderr.exceeded && reason === undefined) {
-				reason = "stderr-too-large";
-				terminate(child);
+			if (stderr.exceeded) {
+				setReason("stderr-too-large");
+				terminateWithEscalation();
 			}
 		});
-		child.on("error", (error: NodeJS.ErrnoException) => {
+		child.on("exit", () => {
 			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", abort);
-			resolveResult({
+			terminateProcessTree(child, "SIGKILL");
+			pipeGuard = setTimeout(() => {
+				if (finalReason !== undefined || child.exitCode !== 0) {
+					finish(child.exitCode);
+					return;
+				}
+				settleWith({
+					ok: false,
+					reason: "invalid-output",
+					stdout: stdout.text,
+					stderr: stderr.text,
+					code: child.exitCode,
+				});
+			}, TREE_KILL_GRACE_MS);
+		});
+		child.on("error", (error: NodeJS.ErrnoException) => {
+			settleWith({
 				ok: false,
 				reason: error.code === "ENOENT" ? "binary-missing" : "spawn-error",
 				stdout: stdout.text,
@@ -228,34 +282,10 @@ function spawnMailcrawl(
 				code: null,
 			});
 		});
-		child.on("close", (code) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", abort);
-			resolveResult({
-				ok: code === 0 && reason === undefined,
-				...(reason === undefined ? (code === 0 ? {} : { reason: "nonzero-exit" as const }) : { reason }),
-				stdout: stdout.text,
-				stderr: stderr.text,
-				code,
-			});
-		});
+		child.on("close", (code) => finish(code));
 	});
 }
 
-function terminate(child: ChildProcess): void {
-	if (child.killed) return;
-	if (process.platform !== "win32" && child.pid !== undefined) {
-		try {
-			process.kill(-child.pid, "SIGTERM");
-			return;
-		} catch {
-			/* swallow process-group fallback */
-		}
-	}
-	child.kill("SIGTERM");
-}
 function parseJson(text: string): unknown {
 	try {
 		return JSON.parse(text.trim());

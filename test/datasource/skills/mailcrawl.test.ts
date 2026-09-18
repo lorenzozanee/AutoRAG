@@ -96,6 +96,56 @@ describe("MailcrawlClient", () => {
 		expect(recorded.every((call) => call.dataDir === null)).toBe(true);
 		expect(recorded.every((call) => call.openai === null)).toBe(true);
 	});
+	it("kills a descendant that ignores SIGTERM after timeout", async () => {
+		const pidPath = join(root, "descendant.pid");
+		writeFileSync(
+			binaryPath,
+			`#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 5000)"], {
+  stdio: "inherit",
+});
+writeFileSync(${JSON.stringify(pidPath)}, String(descendant.pid));
+descendant.unref();
+setTimeout(() => {}, 1000);
+`,
+		);
+		chmodSync(binaryPath, 0o755);
+		const client = new MailcrawlClient({ binaryPath, timeoutMs: 200 });
+		try {
+			const started = Date.now();
+			const result = await client.search("bm25", "query");
+			expect(result).toMatchObject({ ok: false, reason: "timeout" });
+			expect(Date.now() - started).toBeLessThan(1500);
+			const descendantPid = Number(readFileSync(pidPath, "utf8"));
+			expect(() => process.kill(descendantPid, 0)).toThrow();
+		} finally {
+			if (existsSync(pidPath)) {
+				const descendantPid = Number(readFileSync(pidPath, "utf8"));
+				try {
+					process.kill(descendantPid, "SIGKILL");
+				} catch {
+					// The termination path already reaped it.
+				}
+			}
+		}
+	});
+
+	it("preserves the first termination reason when output arrives during cleanup", async () => {
+		writeFileSync(
+			binaryPath,
+			`#!/usr/bin/env node
+setTimeout(() => process.stdout.write("x".repeat(128)), 50);
+setTimeout(() => {}, 1000);
+`,
+		);
+		chmodSync(binaryPath, 0o755);
+		const client = new MailcrawlClient({ binaryPath, timeoutMs: 25, maxBufferBytes: 16 });
+
+		expect(await client.search("bm25", "query")).toMatchObject({ ok: false, reason: "timeout" });
+	});
+
 	it("returns bounded failure results without throwing", async () => {
 		const client = new MailcrawlClient({ binaryPath: join(root, "missing") });
 		expect(await client.search("bm25", "query")).toMatchObject({ ok: false, reason: "binary-missing" });
